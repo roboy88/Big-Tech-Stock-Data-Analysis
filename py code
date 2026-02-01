@@ -1,0 +1,216 @@
+pip install yfinance pandas numpy matplotlib
+python make_visualizations.py
+Big Tech Stock Visualization Generator
+-------------------------------------
+Run this script and it will:
+1) Download historical adjusted prices using yfinance
+2) Compute daily returns, rolling volatility, correlation
+3) Create and SAVE charts into ./figures/
+
+Usage:
+  python make_visualizations.py
+
+Optional:
+  Edit TICKERS, START_DATE, END_DATE below.
+"""
+
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("Missing dependency: yfinance")
+    print("Install it with: pip install yfinance")
+    sys.exit(1)
+
+
+# -------------------------
+# Configuration (edit me)
+# -------------------------
+TICKERS = ["AAPL", "MSFT", "AMZN", "GOOGL", "META"]  # Big Tech starter pack
+START_DATE = "2018-01-01"
+END_DATE = None  # None = up to latest available
+ROLLING_WINDOW_DAYS = 30
+OUT_DIR = "figures"
+DPI = 200
+
+
+def safe_savefig(path: str, dpi: int = 200):
+    """Save a figure safely and close it (prevents memory issues)."""
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi)
+    plt.close()
+
+
+def download_prices(tickers, start, end):
+    """
+    Download auto-adjusted prices (handles splits/dividends).
+    Returns a dataframe of Close prices.
+    """
+    data = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False
+    )
+
+    if data.empty:
+        raise ValueError("No data downloaded. Check your internet, tickers, or date range.")
+
+    # yfinance returns multi-index columns if multiple tickers
+    if isinstance(data.columns, pd.MultiIndex):
+        if "Close" not in data.columns.levels[0]:
+            raise ValueError("Expected 'Close' in downloaded data, but couldn't find it.")
+        prices = data["Close"]
+    else:
+        # single ticker case
+        prices = data.rename(columns={"Close": tickers[0]})[tickers[0]].to_frame()
+
+    # Drop rows/cols with missing values
+    prices = prices.dropna(how="all")
+    prices = prices.dropna(axis=1, how="any")
+
+    if prices.shape[1] == 0:
+        raise ValueError("After cleaning, no ticker has complete data. Try fewer tickers or a later START_DATE.")
+
+    return prices
+
+
+def compute_metrics(prices, rolling_window):
+    returns = prices.pct_change().dropna()
+
+    # Normalize to start at 100 for fair growth comparison
+    normalized = (prices / prices.iloc[0]) * 100
+
+    # Rolling volatility (annualized approximation with sqrt(252))
+    rolling_vol = returns.rolling(rolling_window).std() * np.sqrt(252)
+
+    # Correlation of daily returns
+    corr = returns.corr()
+
+    return returns, normalized, rolling_vol, corr
+
+
+def plot_normalized_prices(normalized, out_dir):
+    plt.figure()
+    normalized.plot(ax=plt.gca())
+    plt.title("Normalized Prices (Start = 100)")
+    plt.xlabel("Date")
+    plt.ylabel("Index Value")
+    safe_savefig(os.path.join(out_dir, "01_normalized_prices.png"), dpi=DPI)
+
+
+def plot_returns_timeseries(returns, out_dir):
+    plt.figure()
+    returns.plot(ax=plt.gca(), alpha=0.7)
+    plt.title("Daily Returns Over Time")
+    plt.xlabel("Date")
+    plt.ylabel("Daily Return")
+    safe_savefig(os.path.join(out_dir, "02_daily_returns_timeseries.png"), dpi=DPI)
+
+
+def plot_rolling_volatility(rolling_vol, window, out_dir):
+    plt.figure()
+    rolling_vol.plot(ax=plt.gca())
+    plt.title(f"Rolling Volatility ({window}-day, based on daily returns)")
+    plt.xlabel("Date")
+    plt.ylabel("Volatility (annualized approx.)")
+    safe_savefig(os.path.join(out_dir, "03_rolling_volatility.png"), dpi=DPI)
+
+
+def plot_correlation_heatmap(corr, out_dir):
+    plt.figure()
+    plt.imshow(corr.values, aspect="auto")
+    plt.title("Correlation of Daily Returns")
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.colorbar()
+    safe_savefig(os.path.join(out_dir, "04_correlation_heatmap.png"), dpi=DPI)
+
+
+def plot_return_histograms(returns, out_dir):
+    for t in returns.columns:
+        plt.figure()
+        plt.hist(returns[t].dropna(), bins=50)
+        plt.title(f"Daily Returns Histogram: {t}")
+        plt.xlabel("Daily return")
+        plt.ylabel("Number of days")
+        safe_savefig(os.path.join(out_dir, f"05_returns_hist_{t}.png"), dpi=DPI)
+
+
+def write_summary_txt(prices, returns, corr, out_dir):
+    """
+    Writes a small summary file explaining what's been generated.
+    Useful when presenting to an 8th grader or a manager who is also basically an 8th grader.
+    """
+    summary_path = os.path.join(out_dir, "SUMMARY.txt")
+
+    # Basic growth since start
+    growth = (prices.iloc[-1] / prices.iloc[0] - 1.0).sort_values(ascending=False)
+
+    # Volatility estimate (std of daily returns annualized-ish)
+    vol = (returns.std() * np.sqrt(252)).sort_values(ascending=False)
+
+    # Most correlated pair
+    corr_no_diag = corr.copy()
+    np.fill_diagonal(corr_no_diag.values, np.nan)
+    max_corr = corr_no_diag.unstack().dropna().sort_values(ascending=False)
+    top_pair = max_corr.index[0]
+    top_val = max_corr.iloc[0]
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("Big Tech Stock Visualization Summary\n")
+        f.write("-----------------------------------\n\n")
+        f.write(f"Tickers used: {list(prices.columns)}\n")
+        f.write(f"Date range: {prices.index.min().date()} to {prices.index.max().date()}\n\n")
+
+        f.write("Growth since start (approx):\n")
+        for k, v in growth.items():
+            f.write(f"  {k}: {v:.2%}\n")
+        f.write("\n")
+
+        f.write("Volatility (higher = more jumpy/risky):\n")
+        for k, v in vol.items():
+            f.write(f"  {k}: {v:.2f}\n")
+        f.write("\n")
+
+        f.write(f"Most correlated pair (returns): {top_pair[0]} & {top_pair[1]} = {top_val:.2f}\n\n")
+
+        f.write("Charts saved:\n")
+        f.write("  01_normalized_prices.png\n")
+        f.write("  02_daily_returns_timeseries.png\n")
+        f.write("  03_rolling_volatility.png\n")
+        f.write("  04_correlation_heatmap.png\n")
+        f.write("  05_returns_hist_<TICKER>.png (one per ticker)\n")
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("Downloading stock data...")
+    prices = download_prices(TICKERS, START_DATE, END_DATE)
+
+    print("Computing metrics...")
+    returns, normalized, rolling_vol, corr = compute_metrics(prices, ROLLING_WINDOW_DAYS)
+
+    print("Generating charts...")
+    plot_normalized_prices(normalized, OUT_DIR)
+    plot_returns_timeseries(returns, OUT_DIR)
+    plot_rolling_volatility(rolling_vol, ROLLING_WINDOW_DAYS, OUT_DIR)
+    plot_correlation_heatmap(corr, OUT_DIR)
+    plot_return_histograms(returns, OUT_DIR)
+
+    print("Writing summary...")
+    write_summary_txt(prices, returns, corr, OUT_DIR)
+
+    print(f"\nDone. Your charts are in: ./{OUT_DIR}/")
+    print("If you don’t see them, check that Python has permission to write files.")
+
+
+if __name__ == "__main__":
+    main()
